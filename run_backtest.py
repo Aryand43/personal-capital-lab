@@ -1,18 +1,25 @@
 import pandas as pd
 
 from capital_lab import backtest, strategy
-from capital_lab.config import BacktestConfig
+from capital_lab.config import BacktestConfig, Guard
 from capital_lab.data import load_prices
 
 
 def build_plans(prices: pd.DataFrame, config: BacktestConfig) -> dict[str, strategy.Plan]:
     known = prices.shift(1)
     etfs, market = known[list(config.universe)], known[config.benchmark]
+    fixes = config.guard
+    guards = {
+        "v2 Core (no fixes)": Guard(),
+        "Fix 1: 5% buffer": Guard(buffer=fixes.buffer),
+        "Fix 2: 2-month confirm": Guard(confirm_months=fixes.confirm_months),
+        "Fix 3: sell half": Guard(off_exposure=fixes.off_exposure),
+        "v3 Core (all 3 fixes)": fixes,
+    }
     return {
-        "v1 Trend per ETF": strategy.trend_per_etf(etfs, market, config),
-        "v2a Crash switch": strategy.crash_switch(etfs, market, config),
-        "v2b Momentum tilt": strategy.momentum(etfs, market, config),
-        "v2 Core (both)": strategy.core_v2(etfs, market, config),
+        "v1 Trend per ETF": strategy.trend_per_etf(etfs, config),
+        **{name: strategy.guarded_momentum(etfs, market, config, guard) for name, guard in guards.items()},
+        "Momentum only": strategy.momentum(etfs, config),
         "Hold all 5 ETFs": strategy.hold(etfs),
         f"Hold {config.benchmark}": strategy.hold(known[[config.benchmark]]),
     }

@@ -3,7 +3,7 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
-from capital_lab.config import BacktestConfig
+from capital_lab.config import BacktestConfig, Guard
 
 
 class Plan(NamedTuple):
@@ -20,7 +20,7 @@ def never(index: pd.DatetimeIndex) -> pd.Series:
     return pd.Series(False, index=index)
 
 
-def above_average(prices: pd.DataFrame | pd.Series, window: int) -> pd.DataFrame | pd.Series:
+def above_average(prices: pd.DataFrame, window: int) -> pd.DataFrame:
     return (prices > prices.rolling(window).mean()).astype(float)
 
 
@@ -35,11 +35,19 @@ def momentum_tilt(prices: pd.DataFrame, lookback: int, top_n: int, top_share: fl
     return leaders.astype(float) * (top_share / top_n - rest) + rest
 
 
-def checked_monthly(signal: pd.Series) -> tuple[pd.Series, pd.Series]:
-    monthly = calendar_schedule(signal.index, "MS")
-    seen = signal.where(monthly).ffill()
-    flips = monthly & seen.ne(seen.shift())
-    return seen, flips
+def guarded_exposure(market: pd.Series, window: int, guard: Guard) -> tuple[pd.Series, pd.Series]:
+    monthly = calendar_schedule(market.index, "MS")
+    price, average = market[monthly], market.rolling(window).mean()[monthly]
+    exposure, streak, decisions = 1.0, 0, []
+    for now, avg in zip(price, average):
+        streak = streak + 1 if now < avg * (1 - guard.buffer) else 0
+        if exposure == 1.0 and streak >= guard.confirm_months:
+            exposure = guard.off_exposure
+        elif exposure < 1.0 and now > avg:
+            exposure = 1.0
+        decisions.append(exposure)
+    seen = pd.Series(decisions, index=price.index).reindex(market.index).ffill()
+    return seen, monthly & seen.ne(seen.shift())
 
 
 def hold(known: pd.DataFrame) -> Plan:
@@ -47,23 +55,17 @@ def hold(known: pd.DataFrame) -> Plan:
     return Plan(targets, never(known.index))
 
 
-def trend_per_etf(known: pd.DataFrame, _: pd.Series, config: BacktestConfig) -> Plan:
+def trend_per_etf(known: pd.DataFrame, config: BacktestConfig) -> Plan:
     targets = equal_weight(above_average(known, config.trend_window))
     return Plan(targets, calendar_schedule(known.index, "MS"))
 
 
-def crash_switch(known: pd.DataFrame, market: pd.Series, config: BacktestConfig) -> Plan:
-    risk_on, flips = checked_monthly(above_average(market, config.trend_window))
-    targets = hold(known).targets.mul(risk_on, axis=0)
-    return Plan(targets, calendar_schedule(known.index, "YS") | flips)
-
-
-def momentum(known: pd.DataFrame, _: pd.Series, config: BacktestConfig) -> Plan:
+def momentum(known: pd.DataFrame, config: BacktestConfig) -> Plan:
     targets = momentum_tilt(known, config.momentum_lookback, config.top_n, config.top_share)
     return Plan(targets, calendar_schedule(known.index, "YS"))
 
 
-def core_v2(known: pd.DataFrame, market: pd.Series, config: BacktestConfig) -> Plan:
-    risk_on, flips = checked_monthly(above_average(market, config.trend_window))
-    targets = momentum(known, market, config).targets.mul(risk_on, axis=0)
+def guarded_momentum(known: pd.DataFrame, market: pd.Series, config: BacktestConfig, guard: Guard) -> Plan:
+    exposure, flips = guarded_exposure(market, config.trend_window, guard)
+    targets = momentum(known, config).targets.mul(exposure, axis=0)
     return Plan(targets, calendar_schedule(known.index, "YS") | flips)
